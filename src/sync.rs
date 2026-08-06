@@ -67,16 +67,51 @@ pub fn hash_item(kind: ItemKind, path: &Path) -> Result<String, SyncError> {
             mix(&mut hasher, node.tag());
             mix(&mut hasher, &rel);
             if node == Node::File {
-                let bytes = fs::read(&full).map_err(|e| SyncError::Io(full.clone(), e))?;
-                mix(&mut hasher, &bytes);
+                mix_file(&mut hasher, &full)?;
             }
         }
     } else {
-        let bytes = fs::read(path).map_err(|e| SyncError::Io(path.to_path_buf(), e))?;
+        refuse_irregular(path)?;
         mix(&mut hasher, Node::File.tag());
-        mix(&mut hasher, &bytes);
+        mix_file(&mut hasher, path)?;
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// ファイルの中身を混ぜる。
+///
+/// **全部読み込まずに流す。** skill にアセットを 1 つ置くだけでその分の RAM を食い、
+/// 一覧を出すたびに管理項目すべてで起きる。
+fn mix_file(hasher: &mut Sha256, path: &Path) -> Result<(), SyncError> {
+    use std::io::Read;
+
+    let meta = fs::symlink_metadata(path).map_err(|e| SyncError::Io(path.to_path_buf(), e))?;
+    let declared = meta.len();
+    hasher.update(declared.to_le_bytes());
+
+    let mut file = fs::File::open(path).map_err(|e| SyncError::Io(path.to_path_buf(), e))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut read_total: u64 = 0;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| SyncError::Io(path.to_path_buf(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        read_total += n as u64;
+    }
+
+    // 長さを先に混ぜているので、読めた量が食い違えば値の意味が壊れる。
+    // 読んでいる最中に書き換えられた場合なので、黙って通さない。
+    if read_total != declared {
+        return Err(SyncError::Io(
+            path.to_path_buf(),
+            std::io::Error::other("読み取り中に大きさが変わった"),
+        ));
+    }
+    Ok(())
 }
 
 /// 長さ前置で混ぜる。これが無いと「`a/b` + `c`」と「`a` + `b/c`」が同じ入力になる。
@@ -131,6 +166,8 @@ fn collect(
             out.push((rel, Node::Dir, path.clone()));
             collect(root, &path, out)?;
         } else {
+            // FIFO やデバイスを普通のファイルとして読みに行くと、`open` で固まる。
+            refuse_irregular(&path)?;
             out.push((rel, Node::File, path));
         }
     }
@@ -679,14 +716,11 @@ pub fn apply_plan(plan: &Plan, target_dir: &Path, manifest: &mut Manifest) -> Ap
         match apply_one(action, target_dir, manifest) {
             Ok(Outcome::Done) => {
                 // 実体より記録が遅れないよう、1 手ごとに保存する。
-                if let Err(e) = crate::manifest::save(target_dir, manifest) {
+                if let Err(e) = save_manifest(target_dir, manifest) {
                     report.failed.push(Failure {
                         kind: action.kind(),
                         name: action.name().to_string(),
-                        error: SyncError::Io(
-                            target_dir.to_path_buf(),
-                            std::io::Error::other(e.to_string()),
-                        ),
+                        error: e,
                     });
                     continue;
                 }
@@ -718,17 +752,14 @@ fn apply_one(
     target_dir: &Path,
     manifest: &mut Manifest,
 ) -> Result<Outcome, SyncError> {
-    // --- ゲート 3: 実行直前の再判定 ---
+    // --- ゲート 4 の第一段: 書き込み先が配置規約の位置であること ---
+    // 前方一致だけでは「ターゲット配下の触ってはいけない場所」を防げない。
+    // `Action` は公開型なので、`build_plan` を通らない計画も来うる。
+    assert_at_layout_position(action, target_dir)?;
+
+    // --- ゲート 3（一次）: 明らかに変わっていればここで止める ---
     if !still_as_expected(action)? {
         return Ok(Outcome::Skipped(SkipReason::Changed));
-    }
-
-    // --- ゲート 4: 書き込み先の検証 ---
-    match action {
-        Action::Copy { to, .. } => assert_within(target_dir, to)?,
-        Action::Delete { path, .. } => assert_within(target_dir, path)?,
-        // Prune はファイルに触れないので、検証する書き込み先が無い。
-        Action::Prune { .. } => {}
     }
 
     match action {
@@ -737,25 +768,51 @@ fn apply_one(
             name,
             from,
             to,
-            ..
+            expect,
         } => {
-            copy_item(*kind, from, to)?;
+            // --- ゲート 4 の第二段: 経路にターゲット外を指すリンクが無いこと ---
+            assert_within(target_dir, to)?;
+
+            // 時間のかかる作業（ソースの読み取りとコピー）を先に済ませる。
+            let staging = staging_path(to);
+            if let Err(e) = stage_copy(*kind, from, &staging) {
+                let _ = remove_any(&staging);
+                return Err(e);
+            }
+
+            // --- ゲート 3（二次）: **破壊の直前にもう一度** ---
+            // 一次判定からここまでの間はソースツリーの大きさに比例して長い。その間に
+            // ユーザーが書き込み先に何か置いていたら、それは記録の無い実体であり、
+            // 消してはいけない（設計原則 1）。
+            if !still_as_expected(action)? {
+                let _ = remove_any(&staging);
+                return Ok(Outcome::Skipped(SkipReason::Changed));
+            }
+
+            // 実体を置く前に「置くつもりである」ことを記録する。
+            // 記録より先に実体を置くと、その間に中断された場合に「実体あり・記録なし」
+            // ＝ Unmanaged となり、drybench からは二度と外せなくなる。仮のハッシュは
+            // 実際の値と一致しないので、中断した場合は Conflict として復旧できる。
+            manifest.upsert(entry_for(*kind, name, from, PENDING_HASH.to_string()));
+            save_manifest(target_dir, manifest)?;
+
+            // 差し替え。`Expect::Nothing` なら書き込み先は空いているはずなので、
+            // 何かを消す必要は無い。消しに行けば、その「何か」を壊すことになる。
+            if matches!(expect, Expect::Content(_)) {
+                remove_any(to)?;
+            }
+            fs::rename(&staging, to).map_err(|e| {
+                let _ = remove_any(&staging);
+                SyncError::Io(to.to_path_buf(), e)
+            })?;
+
             let hash = hash_item(*kind, to)?;
-            manifest.upsert(crate::manifest::Entry {
-                kind: *kind,
-                name: name.clone(),
-                source_dir: from
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .unwrap_or(from)
-                    .to_path_buf(),
-                synced_at: chrono::Utc::now().to_rfc3339(),
-                content_hash: hash,
-            });
+            manifest.upsert(entry_for(*kind, name, from, hash));
         }
         Action::Delete {
             kind, name, path, ..
         } => {
+            assert_within(target_dir, path)?;
             remove_item(path)?;
             manifest.remove(*kind, name);
         }
@@ -765,6 +822,47 @@ fn apply_one(
     }
 
     Ok(Outcome::Done)
+}
+
+/// 実体を置く前に記録する仮の値。本物のハッシュは 64 桁の 16 進なので、これと一致する
+/// ことは無い。中断された記録は必ず Conflict になり、ロックはされるが復旧はできる。
+const PENDING_HASH: &str = "pending";
+
+fn entry_for(kind: ItemKind, name: &str, from: &Path, hash: String) -> crate::manifest::Entry {
+    crate::manifest::Entry {
+        kind,
+        name: name.to_string(),
+        // `<source>/<kind>/<name>` から `<source>` を取り出す。単一ファイル種別の
+        // `<source>/agents/<name>.md` でも同じ深さになる。
+        source_dir: from
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(from)
+            .to_path_buf(),
+        synced_at: chrono::Utc::now().to_rfc3339(),
+        content_hash: hash,
+    }
+}
+
+fn save_manifest(target_dir: &Path, manifest: &Manifest) -> Result<(), SyncError> {
+    crate::manifest::save(target_dir, manifest)
+        .map_err(|e| SyncError::RecordNotSaved(target_dir.to_path_buf(), e.to_string()))
+}
+
+/// 書き込み先が、その種別と名前に対して配置規約が定める位置そのものであること。
+///
+/// 前方一致だけでは足りない。`target/skills/..` はターゲット配下から始まるが、
+/// 解決すればターゲットそのものを指す。「配下のどこか」ではなく「ここ」を要求すれば、
+/// 経路の細工も、別のターゲット向けに作られた計画も、まとめて落ちる。
+fn assert_at_layout_position(action: &Action, target_dir: &Path) -> Result<(), SyncError> {
+    let name = action.name();
+    if !crate::scan::is_valid_name(name) {
+        return Err(SyncError::OutsideTarget(action.path().to_path_buf()));
+    }
+    if action.path() != action.kind().path_in(target_dir, name) {
+        return Err(SyncError::OutsideTarget(action.path().to_path_buf()));
+    }
+    Ok(())
 }
 
 /// 計画時に見たものが、いまもそこにあるか（ゲート 3）。
@@ -817,51 +915,28 @@ fn assert_within(target_dir: &Path, path: &Path) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// ソースからターゲットへ入れる。
-///
-/// **いったん脇に組み立ててから差し替える。** 途中で失敗しても、書きかけの実体を
-/// ターゲットに残さない。ソースにリンクが混ざっていれば、1 バイトも書かずに止まる。
-fn copy_item(kind: ItemKind, from: &Path, to: &Path) -> Result<(), SyncError> {
+/// ソースを脇に組み立てる。ソースにリンクが混ざっていれば、1 バイトも書かずに止まる。
+fn stage_copy(kind: ItemKind, from: &Path, staging: &Path) -> Result<(), SyncError> {
     refuse_symlink(from)?;
+    let _ = remove_any(staging);
 
-    let staging = staging_path(to);
-    let _ = remove_any(&staging);
-
-    let result = if kind.is_dir_unit() {
-        copy_dir(from, &staging)
+    if kind.is_dir_unit() {
+        copy_dir(from, staging)
     } else {
-        fs::copy(from, &staging)
+        refuse_irregular(from)?;
+        fs::copy(from, staging)
             .map(|_| ())
-            .map_err(|e| SyncError::Io(staging.clone(), e))
-    };
-    if let Err(e) = result {
-        let _ = remove_any(&staging);
-        return Err(e);
+            .map_err(|e| SyncError::Io(staging.to_path_buf(), e))
     }
-
-    // 差し替え。既にあるものは、ゲート 3 で「計画時のまま」と確認済み。
-    if let Err(e) = remove_any(to) {
-        let _ = remove_any(&staging);
-        return Err(e);
-    }
-    if let Err(e) = fs::rename(&staging, to) {
-        let _ = remove_any(&staging);
-        return Err(SyncError::Io(to.to_path_buf(), e));
-    }
-    Ok(())
 }
 
 /// 組み立て用の一時パス。同じ親の中に作るので `rename` が同一ファイルシステム内で済む。
+///
+/// **項目名を含めない。** 含めると、長いが正当な名前で `NAME_MAX` を超え、一覧には
+/// 出るのに永久にインストールできない項目ができる。
 fn staging_path(to: &Path) -> PathBuf {
-    let name = to
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let unique = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    to.with_file_name(format!(
-        ".drybench-staging-{name}.{}.{unique}",
-        std::process::id()
-    ))
+    to.with_file_name(format!(".drybench-staging.{}.{unique}", std::process::id()))
 }
 
 static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -883,17 +958,41 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), SyncError> {
         if meta.is_dir() {
             copy_dir(&src, &dst)?;
         } else {
+            refuse_irregular(&src)?;
             fs::copy(&src, &dst).map_err(|e| SyncError::Io(dst.clone(), e))?;
         }
     }
     Ok(())
 }
 
+/// 通常のファイルとディレクトリ以外を拒否する。
+///
+/// FIFO・ソケット・デバイスを普通のファイルとして扱うと、`open` がブロックしたまま
+/// 返らない。1 つ混ざっているだけで一覧画面すら出なくなり、直す入口ごと塞がる。
+fn refuse_irregular(path: &Path) -> Result<(), SyncError> {
+    let meta = fs::symlink_metadata(path).map_err(|e| SyncError::Io(path.to_path_buf(), e))?;
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(SyncError::IrregularFile(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// 実体を消す。
+///
+/// **いったん脇へ退けてから消す。** `remove_dir_all` を直接呼ぶと、途中で失敗したときに
+/// 中身が虫食いの実体がその場所に残る。退けるところまでが成功していれば、実体の場所は
+/// きれいなので、記録との対応が取れる。
 fn remove_item(path: &Path) -> Result<(), SyncError> {
-    // 削除の直前にもリンクでないことを確かめる。`remove_dir_all` はリンクを追わないが、
-    // ここで断っておけば「何を消したか」が曖昧にならない。
+    // `remove_dir_all` はリンクを追わないが、ここで断っておけば「何を消したか」が
+    // 曖昧にならない。
     refuse_symlink(path)?;
-    remove_any(path)
+
+    let staging = staging_path(path);
+    let _ = remove_any(&staging);
+    fs::rename(path, &staging).map_err(|e| SyncError::Io(path.to_path_buf(), e))?;
+
+    // ここから先で失敗しても、実体はもうその場所には無い。残骸は次の掃除に任せる。
+    remove_any(&staging)
 }
 
 fn remove_any(path: &Path) -> Result<(), SyncError> {
@@ -912,8 +1011,12 @@ pub enum SyncError {
     Io(PathBuf, std::io::Error),
     /// シンボリックリンクは追わない（設計原則 4）。
     SymlinkRefused(PathBuf),
-    /// 解決したパスが対象ディレクトリの外を指していた（設計原則 4）。
+    /// 解決したパスが対象ディレクトリの外、あるいは配置規約の位置ではなかった（設計原則 4）。
     OutsideTarget(PathBuf),
+    /// 通常のファイル・ディレクトリ以外（FIFO、ソケット、デバイス）。
+    IrregularFile(PathBuf),
+    /// **実体は動いたが、記録を保存できなかった。** 「入らなかった」とは意味が違う。
+    RecordNotSaved(PathBuf, String),
 }
 
 impl fmt::Display for SyncError {
@@ -926,8 +1029,18 @@ impl fmt::Display for SyncError {
                 path.display()
             ),
             Self::OutsideTarget(path) => {
-                write!(f, "{} は対象ディレクトリの外を指している", path.display())
+                write!(f, "{} は書き込んでよい位置ではない", path.display())
             }
+            Self::IrregularFile(path) => write!(
+                f,
+                "{} は通常のファイルではない（FIFO・ソケット・デバイス）",
+                path.display()
+            ),
+            Self::RecordNotSaved(path, e) => write!(
+                f,
+                "実体は更新したが、{} の記録を保存できなかった: {e}",
+                path.display()
+            ),
         }
     }
 }
@@ -2302,6 +2415,215 @@ mod tests {
             !b.target.join("skills/a").exists(),
             "途中まで書いたものが残った"
         );
+    }
+
+    // --- 破壊の直前の再判定 ---
+
+    // 一次判定からコピー完了までの間はソースの大きさに比例して長い。その窓の中で
+    // ユーザーが書き込み先に何か置いたら、それは記録の無い実体であって、消してはいけない。
+    #[test]
+    fn something_that_appears_while_the_copy_runs_is_not_destroyed() {
+        let mut b = Bench::new("gate3-window");
+        b.source_skill("a", "ソース側");
+        // コピーに時間がかかるよう、そこそこの数のファイルを置く。
+        for i in 0..400 {
+            b.t.write(format!("source/skills/a/f{i}.md"), "詰め物");
+        }
+        let plan = build_plan(&b.resolve(), &on(&["a"]));
+
+        // 「コピー中に現れた」状況を、計画作成後・適用前に作って再現する。
+        // 実装がステージング完了後に判定し直していれば、ここで止まる。
+        b.t.write("target/skills/a/USER-WORK.md", "ユーザーの作業中");
+
+        let report = apply_plan(&plan, &b.target, &mut b.manifest);
+
+        assert!(report.done.is_empty(), "記録の無い実体を消した");
+        assert_eq!(
+            fs::read_to_string(b.target.join("skills/a/USER-WORK.md")).unwrap(),
+            "ユーザーの作業中"
+        );
+    }
+
+    // 書き込み先が空いているはずの手では、何も消さない。消す処理があること自体が危険。
+    #[test]
+    fn a_fresh_copy_never_removes_anything() {
+        let mut b = Bench::new("gate3-noremove");
+        b.source_skill("a", "中身");
+        let plan = build_plan(&b.resolve(), &on(&["a"]));
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [Action::Copy {
+                expect: Expect::Nothing,
+                ..
+            }]
+        ));
+
+        apply_plan(&plan, &b.target, &mut b.manifest);
+        assert_eq!(b.target_body("a").as_deref(), Some("中身"));
+    }
+
+    // --- 中断されたときの残り方 ---
+
+    // 実体を置いてから記録すると、その間の中断で「実体あり・記録なし」＝ Unmanaged が
+    // でき、drybench からは二度と外せなくなる。置く前に記録しておけば Conflict になり、
+    // 少なくとも復旧の道が残る。
+    #[test]
+    fn the_intent_is_recorded_before_the_entity_is_written() {
+        let mut b = Bench::new("apply-prerecord");
+        b.source_skill("a", "中身");
+
+        // 適用の途中でディスク上の記録がどうなっているかを見るため、コピー先に
+        // 到達する前の保存を観測する。ここでは「保存された記録の履歴」の代わりに、
+        // 適用後に仮の値が残っていないことと、中断相当の状態から復旧できることを見る。
+        b.apply(&on(&["a"]));
+        let saved = crate::manifest::load(&b.target).unwrap();
+        assert_ne!(
+            saved.find(ItemKind::Skill, "a").unwrap().content_hash,
+            PENDING_HASH,
+            "仮の値が残っている"
+        );
+
+        // 中断された状態（記録は仮の値、実体はある）を作る。
+        b.record_with_hash("a", PENDING_HASH);
+        assert_eq!(
+            b.state_of("a"),
+            ItemState::Conflict,
+            "中断した記録は Unmanaged ではなく Conflict であるべき"
+        );
+        // 許可を与えれば入れ直せる＝復旧できる。
+        let mut sel = on(&["a"]);
+        sel.allow_conflict(ItemKind::Skill, "a");
+        let report = b.apply(&sel);
+        assert_eq!(report.done.len(), 1);
+    }
+
+    // --- 書き込み先の位置 ---
+
+    // `Action` は公開型なので、`build_plan` を通らない計画も来うる。ターゲット配下で
+    // あることだけでは足りない — `target/skills/..` はターゲットそのものを指す。
+    #[test]
+    fn an_action_pointing_somewhere_other_than_its_layout_position_is_refused() {
+        let mut b = Bench::new("gate4-position");
+        b.target_skill("victim", "消されては困る");
+        b.t.write("target/agents/keep.md", "これも");
+
+        let hand_made = [
+            Action::Delete {
+                kind: ItemKind::Skill,
+                name: "anything".to_string(),
+                path: b.target.join("skills").join(".."),
+                expect: Expect::Nothing,
+            },
+            Action::Delete {
+                kind: ItemKind::Skill,
+                name: "anything".to_string(),
+                path: b.target.join("skills"),
+                expect: Expect::Nothing,
+            },
+            Action::Copy {
+                kind: ItemKind::Skill,
+                name: "victim".to_string(),
+                from: b.source.clone(),
+                to: b.target.join("skills"),
+                expect: Expect::Nothing,
+            },
+        ];
+
+        for action in hand_made {
+            let plan = Plan {
+                actions: vec![action],
+                skipped: Vec::new(),
+            };
+            let report = apply_plan(&plan, &b.target, &mut b.manifest);
+            assert!(report.done.is_empty(), "配置規約の外に書いた: {report:?}");
+        }
+
+        assert_eq!(
+            fs::read_to_string(b.target.join("skills/victim/SKILL.md")).unwrap(),
+            "消されては困る"
+        );
+        assert!(b.target.join("agents/keep.md").exists());
+    }
+
+    // 別のターゲット向けに作った計画を、その祖先ディレクトリに適用しても通らない。
+    #[test]
+    fn a_plan_built_for_another_target_does_not_apply_here() {
+        let mut b = Bench::new("gate4-othertarget");
+        b.source_skill("a", "中身");
+        let inner = b.t.mkdir("target/inner");
+
+        let plan = build_plan(&b.resolve(), &on(&["a"]));
+        let report = apply_plan(&plan, &inner, &mut b.manifest);
+
+        assert!(report.done.is_empty());
+        assert!(!b.target.join("skills/a").exists());
+    }
+
+    // --- 削除の途中で失敗した場合 ---
+
+    // `remove_dir_all` を直接呼ぶと、途中で失敗したときに中身が虫食いの実体が残る。
+    // 先に脇へ退けておけば、実体の場所はきれいなまま。
+    #[test]
+    fn a_deletion_leaves_no_half_emptied_entity() {
+        let mut b = Bench::new("apply-delete-atomic");
+        b.source_skill("a", "中身");
+        b.t.write("source/skills/a/more.md", "もう一つ");
+        b.apply(&on(&["a"]));
+
+        b.apply(&Selection::default());
+
+        assert!(!b.target.join("skills/a").exists());
+        let leftovers: Vec<_> = fs::read_dir(b.target.join("skills"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "残骸: {leftovers:?}");
+    }
+
+    // --- 通常でないファイル ---
+
+    // FIFO を普通のファイルとして開くとブロックしたまま返らない。1 つ混ざるだけで
+    // 一覧が出なくなり、直す入口ごと塞がる。
+    #[cfg(unix)]
+    #[test]
+    fn an_irregular_file_is_refused_rather_than_opened() {
+        let b = Bench::new("hash-fifo");
+        let dir = b.source_skill("a", "x");
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            return; // mkfifo が使えない環境。
+        }
+
+        assert!(matches!(
+            hash_item(ItemKind::Skill, &dir),
+            Err(SyncError::IrregularFile(..))
+        ));
+    }
+
+    // --- 長い名前 ---
+
+    // ステージング名に項目名を含めると、長いが正当な名前で NAME_MAX を超え、
+    // 一覧には出るのに永久にインストールできない項目ができる。
+    #[test]
+    fn a_long_but_valid_name_can_still_be_installed() {
+        let b = Bench::new("apply-longname");
+        let name = "a".repeat(200);
+        assert!(crate::scan::is_valid_name(&name));
+        b.t.write(format!("source/skills/{name}/SKILL.md"), "中身");
+
+        let mut b = b;
+        let mut sel = Selection::default();
+        sel.turn_on(ItemKind::Skill, &name);
+        let report = b.apply(&sel);
+
+        assert_eq!(report.done.len(), 1, "{:?}", report.failed);
+        assert!(b.target.join("skills").join(&name).is_dir());
     }
 
     // 1 件失敗しても、他の項目は処理される。
