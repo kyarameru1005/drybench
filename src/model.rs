@@ -42,6 +42,14 @@ impl ItemKind {
         self.required_file().is_some()
     }
 
+    /// 一覧での種別の並び順。`ALL` の宣言順と一致させる。
+    pub fn list_order(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("ALL は全種別")
+    }
+
     /// ディレクトリ単位の種別で、実体と認めるために必須のファイル。
     /// これが無いディレクトリは項目として扱わない。
     pub fn required_file(self) -> Option<&'static str> {
