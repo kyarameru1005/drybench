@@ -9,6 +9,12 @@
 //! | マニフェストあり・ハッシュ不一致 | Conflict: 既定スキップ、明示的に許可した場合のみ上書き |
 //!   Conflict: 削除しない、警告表示 |
 //! | マニフェストに無いが実体あり | Unmanaged: 常に上書きしない | Unmanaged: 常に削除しない |
+//! | **実体があるか確認できない** | 記録があれば Conflict、無ければ Unmanaged。**どちらも
+//!   許可では通さない** | 同上 |
+//!
+//! 最後の行は表の 5 番目の状況。「読めなかった」「リンクだった」「同じ実体を指す名前が
+//! 複数ある」など、状態を確定できなかった場合を指す。**確定できないものに例外を作らない** —
+//! Conflict の上書き許可が効くのは、ハッシュ不一致を確かに突き止めたときだけ。
 //!
 //! ゲート（設計原則 1〜4）:
 //!
@@ -22,7 +28,7 @@
 //! 移設時に加えること: `assert_within_claude_dir` を汎用名に変え、ターゲットを引数で受ける
 //! （`~/.claude` ↔ プロジェクトの `.claude/` 切り替えは v0.2）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -206,20 +212,22 @@ pub fn resolve(
         .map(|(kind, name)| {
             let install_path = kind.path_in(target_dir, &name);
             let record = manifest.find(kind, &name);
-            let (state, problem) =
-                state_for(kind, &install_path, record.map(|r| r.content_hash.as_str()));
+            let probe = state_for(kind, &install_path, record.map(|r| r.content_hash.as_str()));
             ListedItem {
                 kind,
                 name: name.clone(),
-                state,
+                state: probe.state,
                 source_path: find(source, kind, &name).map(|s| s.path.clone()),
-                target_path: (state != ItemState::Off).then(|| install_path.clone()),
+                // **観測できたときだけ `Some`。** 「入っているはず」という推測を混ぜない。
+                target_path: probe.exists.then(|| install_path.clone()),
                 install_path,
                 recorded: record.is_some(),
-                problem,
+                problem: probe.problem,
             }
         })
         .collect();
+
+    lock_colliding_names(&mut items);
 
     items.sort_by(|a, b| {
         a.state
@@ -242,32 +250,117 @@ pub fn resolve(
 ///
 /// 状態を確定できなかったときは **Conflict（ロック側）に倒す**。「読めなかった」を
 /// 「存在しない」と解釈すると、記録の削除や上書きへ進んでしまう。
-fn state_for(
-    kind: ItemKind,
-    install_path: &Path,
-    recorded_hash: Option<&str>,
-) -> (ItemState, Option<String>) {
+fn state_for(kind: ItemKind, install_path: &Path, recorded_hash: Option<&str>) -> Probe {
     match fs::symlink_metadata(install_path) {
         // 書き込み先は確かに空いている。
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ItemState::Off, None),
-        // 空いているとも埋まっているとも言えない。触らない側に倒す。
-        Err(e) => (
-            ItemState::Conflict,
-            Some(format!("{} を確認できない: {e}", install_path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::off(),
+
+        // 空いているとも埋まっているとも言えない。
+        // **記録が無いなら Unmanaged。** Conflict に倒すと、drybench が入れた覚えの無い
+        // 実体が「上書き許可」ひとつで対象になる。設計原則 1 に override は無い。
+        Err(e) => Probe::locked(
+            recorded_hash.is_some(),
+            format!("{} を確認できない: {e}", install_path.display()),
         ),
+
         Ok(_) => {
             let Some(recorded_hash) = recorded_hash else {
                 // 実体はあるが記録が無い。**触らない**（設計原則 1）。
-                return (ItemState::Unmanaged, None);
+                return Probe::plain(ItemState::Unmanaged);
             };
             match hash_item(kind, install_path) {
-                Ok(h) if h == recorded_hash => (ItemState::On, None),
-                // 記録した後で誰かが書き換えた（設計原則 2）。
-                Ok(_) => (ItemState::Conflict, None),
+                Ok(h) if h == recorded_hash => Probe::plain(ItemState::On),
+                // 記録した後で誰かが書き換えた。**ここだけが上書き許可の効く Conflict** —
+                // 不一致を確かに突き止めた場合（設計原則 2）。
+                Ok(_) => Probe::plain(ItemState::Conflict),
                 // ハッシュが取れない項目が 1 つあっても、一覧全体を出せなくしない
                 // （企画 §7: 見えていること自体が入口）。その項目だけロックする。
-                Err(e) => (ItemState::Conflict, Some(e.to_string())),
+                Err(e) => Probe::locked(true, e.to_string()).exists(),
             }
+        }
+    }
+}
+
+/// `state_for` の結果。
+struct Probe {
+    state: ItemState,
+    problem: Option<String>,
+    /// 実体を**観測できた**か。確認できなかった場合は `false`（憶測を混ぜない）。
+    exists: bool,
+}
+
+impl Probe {
+    fn off() -> Self {
+        Self {
+            state: ItemState::Off,
+            problem: None,
+            exists: false,
+        }
+    }
+
+    fn plain(state: ItemState) -> Self {
+        Self {
+            state,
+            problem: None,
+            exists: true,
+        }
+    }
+
+    /// 判定できなかった項目。記録があれば Conflict、無ければ Unmanaged。
+    /// **`problem` が入っている限り、どちらも上書き許可では通らない。**
+    fn locked(recorded: bool, problem: String) -> Self {
+        Self {
+            state: if recorded {
+                ItemState::Conflict
+            } else {
+                ItemState::Unmanaged
+            },
+            problem: Some(problem),
+            exists: false,
+        }
+    }
+
+    fn exists(mut self) -> Self {
+        self.exists = true;
+        self
+    }
+}
+
+/// 複数の名前が同じ実体を指しているなら、**どれも触らない**。
+///
+/// 大文字小文字を区別しない、あるいは Unicode 正規化を区別しないファイルシステムでは、
+/// `Foo` と `foo` が同じディレクトリになる。状態判定はファイルシステムに訊くので両方とも
+/// 正しく答えるが、一覧には 2 行出る。片方に「Unmanaged・触りません」と表示しながら
+/// もう片方の削除でその実体を消せば、確認画面が事実と食い違う（設計原則 6）。
+/// どちらが正しい行かを機械的に決める根拠は無いので、両方ロックしてユーザーに委ねる。
+fn lock_colliding_names(items: &mut [ListedItem]) {
+    let mut seen: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        if item.target_path.is_none() {
+            continue; // 実体が無ければ衝突しようがない。
+        }
+        if let Ok(real) = fs::canonicalize(&item.install_path) {
+            seen.entry(real).or_default().push(i);
+        }
+    }
+
+    for (real, indexes) in seen {
+        if indexes.len() < 2 {
+            continue;
+        }
+        let names: Vec<&str> = indexes.iter().map(|i| items[*i].name.as_str()).collect();
+        let problem = format!(
+            "{} を複数の名前が指している（{}）。どれを指すか決まらないので触らない",
+            real.display(),
+            names.join(", ")
+        );
+        for i in indexes {
+            items[i].state = if items[i].recorded {
+                ItemState::Conflict
+            } else {
+                ItemState::Unmanaged
+            };
+            items[i].problem = Some(problem.clone());
         }
     }
 }
@@ -401,8 +494,15 @@ pub fn build_plan(items: &[ListedItem], selection: &Selection) -> Plan {
                 ItemState::Unmanaged => plan.skipped.push(skip(SkipReason::Unmanaged)),
                 // 唯一の例外。上書きだけが、項目ごとの明示的な許可で通る。
                 // 削除は表のとおり常に行わない（許可があっても）。
+                //
+                // **許可が効くのは、記録があり、かつ状態を確定できたときだけ。**
+                // `problem` が入っているものは「何なのか分からなかった」ので、許可の
+                // 対象にしない。分からないものへの例外は、例外ではなく穴になる。
                 ItemState::Conflict
-                    if wants_on && selection.conflict_allowed(item.kind, &item.name) =>
+                    if wants_on
+                        && item.recorded
+                        && item.problem.is_none()
+                        && selection.conflict_allowed(item.kind, &item.name) =>
                 {
                     match &item.source_path {
                         Some(from) => plan.actions.push(copy(item, from)),
@@ -1243,7 +1343,7 @@ mod tests {
             let plan = build_plan(&b.resolve(), &Selection::default());
             assert!(plan.is_empty(), "{kind:?}: Off + OFF で何かした");
 
-            // 記録あり・一致 + OFF → 削除
+            // 記録あり・一致 + OFF → 削除、+ ON → 再コピー
             let mut b = Bench::new(&tag);
             b.put("source", kind, "x", "x");
             b.put("target", kind, "x", "x");
@@ -1253,6 +1353,15 @@ mod tests {
             assert!(
                 matches!(plan.actions.as_slice(), [Action::Delete { .. }]),
                 "{kind:?}: On + OFF が削除にならない"
+            );
+            let mut sel = Selection::default();
+            sel.turn_on(kind, "x");
+            assert!(
+                matches!(
+                    build_plan(&b.resolve(), &sel).actions.as_slice(),
+                    [Action::Copy { .. }]
+                ),
+                "{kind:?}: On + ON が再コピーにならない"
             );
 
             // 記録あり・不一致 → 許可が無ければどちらの向きでも触らない
@@ -1274,6 +1383,17 @@ mod tests {
             assert!(
                 build_plan(&b.resolve(), &sel).actions.is_empty(),
                 "{kind:?}: Conflict を削除した"
+            );
+            // ON かつ許可があるときだけ上書きが通る。
+            let mut sel = Selection::default();
+            sel.turn_on(kind, "x");
+            sel.allow_conflict(kind, "x");
+            assert!(
+                matches!(
+                    build_plan(&b.resolve(), &sel).actions.as_slice(),
+                    [Action::Copy { .. }]
+                ),
+                "{kind:?}: 許可があるのに上書きされない"
             );
 
             // 記録なし・実体あり → どちらの向きでも、どんな許可があっても触らない
@@ -1360,6 +1480,165 @@ mod tests {
         assert!(
             matches!(plan.actions.as_slice(), [Action::Prune { path, .. }] if path == &b.target.join("skills/gone"))
         );
+    }
+
+    // --- 確定できなかったものに例外を作らない ---
+
+    // 「確認できない」を Conflict に倒すと、drybench が入れた覚えの無い実体が
+    // 上書き許可ひとつで対象になる。設計原則 1 に override は無い。
+    #[cfg(unix)]
+    #[test]
+    fn an_entity_we_cannot_inspect_is_unmanaged_when_there_is_no_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let b = Bench::new("undetermined-norecord");
+        b.source_skill("a", "ソース側");
+        b.target_skill("a", "ユーザーの実体");
+
+        let dir = b.target.join("skills");
+        let original = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let items = b.resolve();
+        let plans: Vec<Plan> = selections(ItemKind::Skill, "a")
+            .iter()
+            .map(|sel| build_plan(&items, sel))
+            .collect();
+
+        fs::set_permissions(&dir, original).unwrap();
+
+        assert_eq!(items[0].state, ItemState::Unmanaged);
+        assert!(items[0].problem.is_some());
+        for plan in plans {
+            assert!(
+                plan.actions.is_empty(),
+                "確認できない実体が計画に入った: {plan:?}"
+            );
+        }
+    }
+
+    // 記録があっても、状態を確定できていないなら許可は効かない。
+    #[cfg(unix)]
+    #[test]
+    fn permission_does_not_apply_to_a_conflict_we_could_not_determine() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut b = Bench::new("undetermined-recorded");
+        b.source_skill("a", "ソース側");
+        b.target_skill("a", "x");
+        b.record_matching("a");
+
+        let dir = b.target.join("skills");
+        let original = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let items = b.resolve();
+        let mut sel = on(&["a"]);
+        sel.allow_conflict(ItemKind::Skill, "a");
+        let plan = build_plan(&items, &sel);
+
+        fs::set_permissions(&dir, original).unwrap();
+
+        assert_eq!(items[0].state, ItemState::Conflict);
+        assert!(items[0].problem.is_some());
+        assert!(plan.actions.is_empty(), "確定できていないのに上書きした");
+    }
+
+    // `hash_item` がいったん拒否したリンクを、許可で書き込み先に昇格させない。
+    // ゲート 4 だけが防壁になる状態を作らない（設計原則 4）。
+    #[cfg(unix)]
+    #[test]
+    fn permission_does_not_promote_a_refused_symlink_to_a_destination() {
+        let mut b = Bench::new("undetermined-symlink");
+        b.source_skill("linked", "ソース側");
+        let outside = b.t.mkdir("outside");
+        fs::write(outside.join("SKILL.md"), "ターゲットの外").unwrap();
+        fs::create_dir_all(b.target.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&outside, b.target.join("skills/linked")).unwrap();
+        b.record_with_hash("linked", "何であれ一致しない");
+
+        let items = b.resolve();
+        let mut sel = on(&["linked"]);
+        sel.allow_conflict(ItemKind::Skill, "linked");
+
+        assert!(items[0].problem.is_some());
+        assert!(
+            build_plan(&items, &sel).actions.is_empty(),
+            "拒否したリンクが書き込み先になった"
+        );
+    }
+
+    // 設計原則 1 の文言そのもの: 記録の無い実体は、どんな選択でも計画に入らない。
+    #[test]
+    fn nothing_without_a_record_ever_enters_the_plan() {
+        let mut b = Bench::new("norecord-property");
+        b.target_skill("stranger", "x");
+        b.source_skill("fresh", "x");
+        b.source_skill("known", "x");
+        b.target_skill("known", "x");
+        b.record_matching("known");
+
+        let items = b.resolve();
+        for kind in ItemKind::ALL {
+            for name in ["stranger", "fresh", "known"] {
+                for sel in selections(kind, name) {
+                    let plan = build_plan(&items, &sel);
+                    for action in &plan.actions {
+                        let acted = match action {
+                            Action::Copy { name, .. }
+                            | Action::Delete { name, .. }
+                            | Action::Prune { name, .. } => name,
+                        };
+                        let item = items.iter().find(|i| &i.name == acted).unwrap();
+                        // 記録の無いものに対する唯一の正当な action は、新規コピー
+                        // （書き込み先が空いていることを確認済み）。
+                        assert!(
+                            item.recorded || matches!(action, Action::Copy { .. }),
+                            "記録の無い実体を触ろうとした: {action:?}"
+                        );
+                        if !item.recorded {
+                            assert_eq!(item.state, ItemState::Off, "空き以外へ新規コピーした");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 同じ実体を 2 行として見せ、片方に「触りません」と表示しながらもう片方で消すと、
+    // 確認画面が事実と食い違う（設計原則 6）。どちらの行もロックする。
+    #[test]
+    fn two_names_for_one_entity_lock_each_other() {
+        let mut b = Bench::new("collision-lock");
+        b.t.mkdir("probe/AAA");
+        if !b.t.join("probe/aaa").exists() {
+            return; // 大文字小文字を区別するファイルシステム。
+        }
+
+        b.target_skill("foo", "ユーザーの実体");
+        b.record_matching("Foo");
+        b.source_skill("Foo", "ソース側");
+
+        let items = b.resolve();
+        assert_eq!(items.len(), 2);
+        assert!(
+            items.iter().all(|i| i.problem.is_some()),
+            "衝突が知らされていない"
+        );
+
+        for sel in selections(ItemKind::Skill, "Foo") {
+            assert!(build_plan(&items, &sel).actions.is_empty());
+        }
+    }
+
+    // `target_path` は観測の記録であって主張ではない。
+    #[test]
+    fn the_target_path_is_none_when_nothing_was_observed() {
+        let mut b = Bench::new("targetpath-observed");
+        b.source_skill("a", "x");
+        b.record_with_hash("a", "もう存在しない実体のハッシュ");
+
+        assert!(b.resolve()[0].target_path.is_none());
     }
 
     // マニフェストは手で編集できる。名前を検証せずにパスへ組み立てれば脱出経路になる。

@@ -15,9 +15,17 @@ use crate::model::{DraftItem, ItemKind};
 /// 項目名として受け付けてよいか。**走査時にここで弾く**ことが、パストラバーサルに対する
 /// 最初の防壁になる（設計原則 4）。
 ///
-/// 弾くもの: 空文字、`.` と `..`、パス区切り（`/` `\`）を含むもの、先頭が `.` のもの。
+/// 弾くもの: 空文字、空白だけのもの、`.` と `..`、パス区切り（`/` `\`）を含むもの、
+/// 先頭が `.` のもの、制御文字を含むもの。
+///
+/// **マニフェストは手で編集できる**。そこに書かれた名前もこの関数だけを頼りにパスへ
+/// 組み立てられるので、走査の入口としてだけでなく、記録の検証としても使われる。
 pub fn is_valid_name(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\\')
+    !name.trim().is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
 }
 
 /// `root` 配下の `skills/` `agents/` `hooks/` を走査する。
@@ -110,6 +118,19 @@ mod tests {
         assert!(!is_valid_name(""));
         assert!(!is_valid_name(".hidden"));
         assert!(!is_valid_name(".DS_Store"));
+    }
+
+    // マニフェストの名前もここだけを頼りにパスへ組み立てられる。手で書かれた
+    // 「見えない名前」を通すと、確認画面に何も表示されない項目ができる。
+    #[test]
+    fn invisible_and_control_character_names_are_rejected() {
+        assert!(!is_valid_name(" "));
+        assert!(!is_valid_name("   "));
+        assert!(!is_valid_name("\t"));
+        assert!(!is_valid_name("a\nb"));
+        assert!(!is_valid_name("a\0b"));
+        // 内側の空白そのものは正当。
+        assert!(is_valid_name("my skill"));
     }
 
     // --- 走査 ---
