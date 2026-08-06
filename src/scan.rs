@@ -79,53 +79,8 @@ fn to_item(path: &Path, kind: ItemKind) -> Option<DraftItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
     use std::fs;
-    use std::path::PathBuf;
-
-    /// テスト用の一時ディレクトリ。`std::env::temp_dir()` の下だけを使う。
-    /// 実在の `~/.claude` には構造上到達しえない（CONTRIBUTING.md の ground rules）。
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            // dev-dependencies を持たないので、一意な名前は自前で作る。
-            let unique = format!(
-                "drybench-test-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            );
-            let path = std::env::temp_dir().join(unique.replace(['(', ')', ' '], ""));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("一時ディレクトリを作れない");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-
-        /// `<root>/<kind>/<name>/<required file>` を作る（skill / hook 用）。
-        fn dir_item(&self, kind: ItemKind, name: &str) {
-            let dir = self.0.join(kind.dir_name()).join(name);
-            fs::create_dir_all(&dir).unwrap();
-            if let Some(required) = kind.required_file() {
-                fs::write(dir.join(required), b"x").unwrap();
-            }
-        }
-
-        /// `<root>/agents/<name>.md` を作る。
-        fn agent_item(&self, name: &str) {
-            let dir = self.0.join(ItemKind::Agent.dir_name());
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join(format!("{name}.md")), b"x").unwrap();
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn names(items: &[DraftItem]) -> Vec<&str> {
         items.iter().map(|i| i.name.as_str()).collect()
