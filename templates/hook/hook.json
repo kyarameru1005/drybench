@@ -1,0 +1,11 @@
+{
+  "description": "One line on what this hook does.",
+  "events": [
+    {
+      "event": "PostToolUse",
+      "matcher": "Bash",
+      "command": "\"$HOME/.claude/hooks/{{name}}/run.sh\"",
+      "timeout": 5
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+[package]
+name = "drybench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A local workbench for your Claude Code setup — inspect ~/.claude, safely toggle skills, subagents and hooks, and spin up new ones to try."
+readme = "README.md"
+repository = "https://github.com/kyarameru1005/drybench"
+homepage = "https://github.com/kyarameru1005/drybench"
+keywords = ["cli", "tui", "claude-code", "skills", "hooks"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/assets", "/docs", "/.github"]
+
+[[bin]]
+name = "drybench"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: ~/.claude/settings.json を読み書きするとき、ユーザーが書いた
+# キーの並び順を変えないため（ハッシュ照合の決定性にも必要）。
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+dirs = "5"
+chrono = { version = "0.4", features = ["clock"] }
+
+# テストは std::env::temp_dir() だけで完結させる。dev-dependencies は持たない。
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

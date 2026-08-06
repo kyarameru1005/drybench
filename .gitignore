@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Personal notes and planning material. Not part of the distribution.
+/docs/private/
+
+# Secrets and local credentials. Never commit these to a public repo.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+secrets.json
+
+# Local Claude Code state (may contain machine paths and personal settings)
+.claude/settings.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
