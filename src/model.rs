@@ -8,7 +8,7 @@
 //! 移設時に加えること: `ItemState::Unmanaged` を「表示しない」から「一覧の先頭に出す」へ。
 //! 管理外の実体が見えていること自体が入口になる（企画 §7）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,14 @@ impl ItemKind {
         self.required_file().is_some()
     }
 
+    /// 一覧での種別の並び順。`ALL` の宣言順と一致させる。
+    pub fn list_order(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("ALL は全種別")
+    }
+
     /// ディレクトリ単位の種別で、実体と認めるために必須のファイル。
     /// これが無いディレクトリは項目として扱わない。
     pub fn required_file(self) -> Option<&'static str> {
@@ -49,6 +57,19 @@ impl ItemKind {
             Self::Skill => Some("SKILL.md"),
             Self::Hook => Some("hook.json"),
             Self::Agent => None,
+        }
+    }
+
+    /// `root` 配下でこの名前の実体が置かれるパス。**まだ存在しなくてよい** —
+    /// 「入れるならここ」を配置規約から一意に決めるためのもの。
+    ///
+    /// `name` の妥当性は検証しない。呼ぶ側が `scan::is_valid_name` を通した名前を渡すこと
+    /// （走査で弾いているので、一覧に載った項目はすべて通過済み）。
+    pub fn path_in(self, root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(self.dir_name());
+        match self.is_dir_unit() {
+            true => dir.join(name),
+            false => dir.join(format!("{name}.md")),
         }
     }
 }
@@ -128,6 +149,25 @@ mod tests {
         assert_eq!(ItemKind::Skill.dir_name(), "skills");
         assert_eq!(ItemKind::Agent.dir_name(), "agents");
         assert_eq!(ItemKind::Hook.dir_name(), "hooks");
+    }
+
+    // 配置規約は templates/README.md と skills/drybench-author/SKILL.md に確定済み。
+    #[test]
+    fn the_install_path_follows_the_documented_layout() {
+        let root = Path::new("/root");
+        assert_eq!(
+            ItemKind::Skill.path_in(root, "x"),
+            Path::new("/root/skills/x")
+        );
+        assert_eq!(
+            ItemKind::Hook.path_in(root, "x"),
+            Path::new("/root/hooks/x")
+        );
+        // agent だけが単一ファイルなので拡張子が付く。
+        assert_eq!(
+            ItemKind::Agent.path_in(root, "x"),
+            Path::new("/root/agents/x.md")
+        );
     }
 
     // 一覧では Unmanaged を先頭に出す（企画 §7）。見えていること自体が import の入口。
