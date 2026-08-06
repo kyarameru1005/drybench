@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -163,6 +164,10 @@ pub struct ListedItem {
     pub install_path: PathBuf,
     /// マニフェストに記録があるか。実体が消えていても記録だけ残ることがある。
     pub recorded: bool,
+    /// 一覧を作った時点でターゲット側にあったものの実際のハッシュ。
+    /// **これが適用直前の再判定の基準**（ゲート 3）— 計画を作ったときに見たものが、
+    /// 実行する瞬間もそこにあるか。
+    pub observed_hash: Option<String>,
     /// 状態を確定できなかった理由（読めない、リンクだった等）。**入っているときは
     /// 状態を Conflict に倒してある** — 判定できないものを触ってよい側に倒さない。
     pub problem: Option<String>,
@@ -222,6 +227,7 @@ pub fn resolve(
                 target_path: probe.exists.then(|| install_path.clone()),
                 install_path,
                 recorded: record.is_some(),
+                observed_hash: probe.observed_hash,
                 problem: probe.problem,
             }
         })
@@ -269,10 +275,10 @@ fn state_for(kind: ItemKind, install_path: &Path, recorded_hash: Option<&str>) -
                 return Probe::plain(ItemState::Unmanaged);
             };
             match hash_item(kind, install_path) {
-                Ok(h) if h == recorded_hash => Probe::plain(ItemState::On),
+                Ok(h) if h == recorded_hash => Probe::plain(ItemState::On).observed(h),
                 // 記録した後で誰かが書き換えた。**ここだけが上書き許可の効く Conflict** —
                 // 不一致を確かに突き止めた場合（設計原則 2）。
-                Ok(_) => Probe::plain(ItemState::Conflict),
+                Ok(h) => Probe::plain(ItemState::Conflict).observed(h),
                 // ハッシュが取れない項目が 1 つあっても、一覧全体を出せなくしない
                 // （企画 §7: 見えていること自体が入口）。その項目だけロックする。
                 Err(e) => Probe::locked(true, e.to_string()).exists(),
@@ -287,6 +293,7 @@ struct Probe {
     problem: Option<String>,
     /// 実体を**観測できた**か。確認できなかった場合は `false`（憶測を混ぜない）。
     exists: bool,
+    observed_hash: Option<String>,
 }
 
 impl Probe {
@@ -295,6 +302,7 @@ impl Probe {
             state: ItemState::Off,
             problem: None,
             exists: false,
+            observed_hash: None,
         }
     }
 
@@ -303,7 +311,13 @@ impl Probe {
             state,
             problem: None,
             exists: true,
+            observed_hash: None,
         }
+    }
+
+    fn observed(mut self, hash: String) -> Self {
+        self.observed_hash = Some(hash);
+        self
     }
 
     /// 判定できなかった項目。記録があれば Conflict、無ければ Unmanaged。
@@ -317,6 +331,7 @@ impl Probe {
             },
             problem: Some(problem),
             exists: false,
+            observed_hash: None,
         }
     }
 
@@ -414,6 +429,10 @@ impl Selection {
 }
 
 /// 実行する 1 手。確認画面はこの一覧をそのまま見せる（設計原則 6）。
+///
+/// **どの手も `expect` を持つ。** これは「計画を作ったとき、対象の場所に何があったか」で、
+/// 適用直前にもう一度確かめる基準になる（ゲート 3）。計画は過去の観測でしかないので、
+/// これが無いと「見たときの状態」で実行してしまう。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// ソースからターゲットへ入れる（新規・更新の両方）。
@@ -422,22 +441,62 @@ pub enum Action {
         name: String,
         from: PathBuf,
         to: PathBuf,
+        expect: Expect,
     },
     /// ターゲットから外す。記録も消す。
     Delete {
         kind: ItemKind,
         name: String,
         path: PathBuf,
+        expect: Expect,
     },
     /// 実体はもう無いが記録だけ残っている。記録を掃除する。
-    ///
-    /// `path` は「無いはずの場所」。適用直前に本当に空いたままかを確かめ直すために持つ
-    /// （ゲート 3）。計画を作った後に実体が戻っていたら、掃除してはいけない。
+    /// 計画を作った後に実体が戻っていたら、掃除してはいけない。
     Prune {
         kind: ItemKind,
         name: String,
         path: PathBuf,
+        expect: Expect,
     },
+}
+
+impl Action {
+    pub fn kind(&self) -> ItemKind {
+        match self {
+            Self::Copy { kind, .. } | Self::Delete { kind, .. } | Self::Prune { kind, .. } => *kind,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Copy { name, .. } | Self::Delete { name, .. } | Self::Prune { name, .. } => name,
+        }
+    }
+
+    /// 実行の対象になるターゲット側のパス。
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Copy { to, .. } => to,
+            Self::Delete { path, .. } | Self::Prune { path, .. } => path,
+        }
+    }
+
+    fn expect(&self) -> &Expect {
+        match self {
+            Self::Copy { expect, .. }
+            | Self::Delete { expect, .. }
+            | Self::Prune { expect, .. } => expect,
+        }
+    }
+}
+
+/// 適用直前に、対象の場所に何があるべきか。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expect {
+    /// 何も無いはず（新規コピー、記録だけの掃除）。
+    Nothing,
+    /// この内容のものがあるはず（更新、削除、許可済みの上書き）。
+    Content(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +514,8 @@ pub enum SkipReason {
     Conflict,
     /// ソースから消えているので、入れ直す元が無い。
     NoSource,
+    /// 計画を作ってから適用までの間に、対象が変わった（ゲート 3）。
+    Changed,
 }
 
 /// 何をするかの一覧。**ここではまだ何も書き込まない。**
@@ -529,6 +590,7 @@ pub fn build_plan(items: &[ListedItem], selection: &Selection) -> Plan {
                     kind: item.kind,
                     name: item.name.clone(),
                     path,
+                    expect: expect_of(item),
                 });
             }
 
@@ -545,6 +607,7 @@ pub fn build_plan(items: &[ListedItem], selection: &Selection) -> Plan {
                         kind: item.kind,
                         name: item.name.clone(),
                         path: item.install_path.clone(),
+                        expect: expect_of(item),
                     });
                 }
             }
@@ -564,6 +627,283 @@ fn copy(item: &ListedItem, from: &Path) -> Action {
         from: from.to_path_buf(),
         // 既に入っている場合も含め、宛先は必ず配置規約から作る。
         to: item.install_path.clone(),
+        expect: expect_of(item),
+    }
+}
+
+/// 計画を作った時点で、その場所に何が見えていたか。
+fn expect_of(item: &ListedItem) -> Expect {
+    match &item.observed_hash {
+        Some(h) => Expect::Content(h.clone()),
+        None => Expect::Nothing,
+    }
+}
+
+// ----------------------------------------------------------------- 適用
+
+/// 適用の結果。確認画面と同じ粒度で、何が起きて何が起きなかったかを返す。
+#[derive(Debug, Default)]
+pub struct ApplyReport {
+    pub done: Vec<Action>,
+    /// ゲートで止まったもの。**失敗ではない** — 触らないのが正しい判断だった場合。
+    pub skipped: Vec<Skipped>,
+    pub failed: Vec<Failure>,
+}
+
+#[derive(Debug)]
+pub struct Failure {
+    pub kind: ItemKind,
+    pub name: String,
+    pub error: SyncError,
+}
+
+/// 計画を実行する。**ここがゲート 3 と 4。**
+///
+/// 1 手ごとに、
+///
+/// 1. 対象の場所がいま何であるかを見直し、計画時の観測（`expect`）と食い違えば飛ばす。
+///    計画は過去の観測でしかないので、その間に変わっていたら実行してはいけない。
+/// 2. 書き込み先の canonical path がターゲット配下にあることを確かめ、対象自体が
+///    シンボリックリンクなら追わずに拒否する。
+///
+/// **成功するたびにマニフェストを保存する。** 実体を置いたのに記録が残らないと、その実体は
+/// 次から Unmanaged になり、drybench からは二度と外せなくなる。途中で止まっても、
+/// そこまでの分は記録と対応が取れている状態にする。
+///
+/// 1 手が失敗しても残りは続ける。1 つの壊れた項目のために他が入らないのは、
+/// ユーザーにとって復旧しにくいだけ。
+pub fn apply_plan(plan: &Plan, target_dir: &Path, manifest: &mut Manifest) -> ApplyReport {
+    let mut report = ApplyReport::default();
+
+    for action in &plan.actions {
+        match apply_one(action, target_dir, manifest) {
+            Ok(Outcome::Done) => {
+                // 実体より記録が遅れないよう、1 手ごとに保存する。
+                if let Err(e) = crate::manifest::save(target_dir, manifest) {
+                    report.failed.push(Failure {
+                        kind: action.kind(),
+                        name: action.name().to_string(),
+                        error: SyncError::Io(
+                            target_dir.to_path_buf(),
+                            std::io::Error::other(e.to_string()),
+                        ),
+                    });
+                    continue;
+                }
+                report.done.push(action.clone());
+            }
+            Ok(Outcome::Skipped(reason)) => report.skipped.push(Skipped {
+                kind: action.kind(),
+                name: action.name().to_string(),
+                reason,
+            }),
+            Err(error) => report.failed.push(Failure {
+                kind: action.kind(),
+                name: action.name().to_string(),
+                error,
+            }),
+        }
+    }
+
+    report
+}
+
+enum Outcome {
+    Done,
+    Skipped(SkipReason),
+}
+
+fn apply_one(
+    action: &Action,
+    target_dir: &Path,
+    manifest: &mut Manifest,
+) -> Result<Outcome, SyncError> {
+    // --- ゲート 3: 実行直前の再判定 ---
+    if !still_as_expected(action)? {
+        return Ok(Outcome::Skipped(SkipReason::Changed));
+    }
+
+    // --- ゲート 4: 書き込み先の検証 ---
+    match action {
+        Action::Copy { to, .. } => assert_within(target_dir, to)?,
+        Action::Delete { path, .. } => assert_within(target_dir, path)?,
+        // Prune はファイルに触れないので、検証する書き込み先が無い。
+        Action::Prune { .. } => {}
+    }
+
+    match action {
+        Action::Copy {
+            kind,
+            name,
+            from,
+            to,
+            ..
+        } => {
+            copy_item(*kind, from, to)?;
+            let hash = hash_item(*kind, to)?;
+            manifest.upsert(crate::manifest::Entry {
+                kind: *kind,
+                name: name.clone(),
+                source_dir: from
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap_or(from)
+                    .to_path_buf(),
+                synced_at: chrono::Utc::now().to_rfc3339(),
+                content_hash: hash,
+            });
+        }
+        Action::Delete {
+            kind, name, path, ..
+        } => {
+            remove_item(path)?;
+            manifest.remove(*kind, name);
+        }
+        Action::Prune { kind, name, .. } => {
+            manifest.remove(*kind, name);
+        }
+    }
+
+    Ok(Outcome::Done)
+}
+
+/// 計画時に見たものが、いまもそこにあるか（ゲート 3）。
+fn still_as_expected(action: &Action) -> Result<bool, SyncError> {
+    let path = action.path();
+    let exists = match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // 見えないなら「変わっていない」とは言えない。
+        Err(e) => return Err(SyncError::Io(path.to_path_buf(), e)),
+    };
+
+    match (action.expect(), exists) {
+        (Expect::Nothing, false) => Ok(true),
+        (Expect::Nothing, true) => Ok(false),
+        (Expect::Content(_), false) => Ok(false),
+        (Expect::Content(expected), true) => Ok(&hash_item(action.kind(), path)? == expected),
+    }
+}
+
+/// 書き込み先がターゲット配下にあることを canonical path で確かめる（設計原則 4）。
+///
+/// パスそのものはまだ存在しなくてよいので、**親を解決してから** 前方一致を見る。
+/// 途中にターゲット外を指すリンクがあれば、解決結果が配下から外れるので落ちる。
+fn assert_within(target_dir: &Path, path: &Path) -> Result<(), SyncError> {
+    let root =
+        fs::canonicalize(target_dir).map_err(|e| SyncError::Io(target_dir.to_path_buf(), e))?;
+
+    // 対象自体がリンクなら追わない。
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(SyncError::SymlinkRefused(path.to_path_buf()));
+        }
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| SyncError::OutsideTarget(path.to_path_buf()))?;
+    // 親が無ければ作る。作る先も同じ検証を通す必要があるので、再帰的に確かめる。
+    if !parent.exists() {
+        assert_within(target_dir, parent)?;
+        fs::create_dir_all(parent).map_err(|e| SyncError::Io(parent.to_path_buf(), e))?;
+    }
+
+    let real_parent =
+        fs::canonicalize(parent).map_err(|e| SyncError::Io(parent.to_path_buf(), e))?;
+    if !real_parent.starts_with(&root) {
+        return Err(SyncError::OutsideTarget(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// ソースからターゲットへ入れる。
+///
+/// **いったん脇に組み立ててから差し替える。** 途中で失敗しても、書きかけの実体を
+/// ターゲットに残さない。ソースにリンクが混ざっていれば、1 バイトも書かずに止まる。
+fn copy_item(kind: ItemKind, from: &Path, to: &Path) -> Result<(), SyncError> {
+    refuse_symlink(from)?;
+
+    let staging = staging_path(to);
+    let _ = remove_any(&staging);
+
+    let result = if kind.is_dir_unit() {
+        copy_dir(from, &staging)
+    } else {
+        fs::copy(from, &staging)
+            .map(|_| ())
+            .map_err(|e| SyncError::Io(staging.clone(), e))
+    };
+    if let Err(e) = result {
+        let _ = remove_any(&staging);
+        return Err(e);
+    }
+
+    // 差し替え。既にあるものは、ゲート 3 で「計画時のまま」と確認済み。
+    if let Err(e) = remove_any(to) {
+        let _ = remove_any(&staging);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&staging, to) {
+        let _ = remove_any(&staging);
+        return Err(SyncError::Io(to.to_path_buf(), e));
+    }
+    Ok(())
+}
+
+/// 組み立て用の一時パス。同じ親の中に作るので `rename` が同一ファイルシステム内で済む。
+fn staging_path(to: &Path) -> PathBuf {
+    let name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let unique = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    to.with_file_name(format!(
+        ".drybench-staging-{name}.{}.{unique}",
+        std::process::id()
+    ))
+}
+
+static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn copy_dir(from: &Path, to: &Path) -> Result<(), SyncError> {
+    fs::create_dir_all(to).map_err(|e| SyncError::Io(to.to_path_buf(), e))?;
+    let entries = fs::read_dir(from).map_err(|e| SyncError::Io(from.to_path_buf(), e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| SyncError::Io(from.to_path_buf(), e))?;
+        let src = entry.path();
+        let meta = fs::symlink_metadata(&src).map_err(|e| SyncError::Io(src.clone(), e))?;
+
+        // ソース側のリンクも追わない。追うとターゲット外の内容を持ち込むことになる。
+        if meta.file_type().is_symlink() {
+            return Err(SyncError::SymlinkRefused(src));
+        }
+
+        let dst = to.join(entry.file_name());
+        if meta.is_dir() {
+            copy_dir(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst).map_err(|e| SyncError::Io(dst.clone(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_item(path: &Path) -> Result<(), SyncError> {
+    // 削除の直前にもリンクでないことを確かめる。`remove_dir_all` はリンクを追わないが、
+    // ここで断っておけば「何を消したか」が曖昧にならない。
+    refuse_symlink(path)?;
+    remove_any(path)
+}
+
+fn remove_any(path: &Path) -> Result<(), SyncError> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SyncError::Io(path.to_path_buf(), e)),
+        Ok(meta) if meta.is_dir() => {
+            fs::remove_dir_all(path).map_err(|e| SyncError::Io(path.to_path_buf(), e))
+        }
+        Ok(_) => fs::remove_file(path).map_err(|e| SyncError::Io(path.to_path_buf(), e)),
     }
 }
 
@@ -1654,5 +1994,330 @@ mod tests {
         });
 
         assert!(b.resolve().is_empty());
+    }
+
+    // ================================================================ 適用
+
+    impl Bench {
+        /// 一覧 → 計画 → 適用まで通す。
+        fn apply(&mut self, sel: &Selection) -> ApplyReport {
+            let plan = build_plan(&self.resolve(), sel);
+            apply_plan(&plan, &self.target, &mut self.manifest)
+        }
+
+        fn target_body(&self, name: &str) -> Option<String> {
+            fs::read_to_string(self.target.join(format!("skills/{name}/SKILL.md"))).ok()
+        }
+    }
+
+    // --- 期待どおりに動く場合 ---
+
+    #[test]
+    fn a_new_item_is_copied_in_and_recorded() {
+        let mut b = Bench::new("apply-new");
+        b.source_skill("a", "中身");
+
+        let report = b.apply(&on(&["a"]));
+
+        assert_eq!(report.done.len(), 1);
+        assert!(report.skipped.is_empty() && report.failed.is_empty());
+        assert_eq!(b.target_body("a").as_deref(), Some("中身"));
+        // 記録が入り、次の一覧では On になる。
+        assert_eq!(b.state_of("a"), ItemState::On);
+    }
+
+    #[test]
+    fn nested_content_is_copied_whole() {
+        let mut b = Bench::new("apply-nested");
+        b.source_skill("a", "s");
+        b.t.write("source/skills/a/deep/inner.md", "奥");
+        b.t.mkdir("source/skills/a/empty");
+
+        b.apply(&on(&["a"]));
+
+        assert_eq!(
+            fs::read_to_string(b.target.join("skills/a/deep/inner.md")).unwrap(),
+            "奥"
+        );
+        assert!(b.target.join("skills/a/empty").is_dir());
+        assert_eq!(b.state_of("a"), ItemState::On);
+    }
+
+    #[test]
+    fn a_single_file_kind_is_copied_as_a_file() {
+        let mut b = Bench::new("apply-agent");
+        b.t.write("source/agents/x.md", "エージェント");
+
+        let mut sel = Selection::default();
+        sel.turn_on(ItemKind::Agent, "x");
+        b.apply(&sel);
+
+        assert_eq!(
+            fs::read_to_string(b.target.join("agents/x.md")).unwrap(),
+            "エージェント"
+        );
+    }
+
+    #[test]
+    fn re_copying_replaces_what_was_there_and_updates_the_record() {
+        let mut b = Bench::new("apply-update");
+        b.source_skill("a", "はじめの中身");
+        b.apply(&on(&["a"]));
+
+        b.source_skill("a", "書き直した中身");
+        b.t.write("source/skills/a/added.md", "足したファイル");
+        b.apply(&on(&["a"]));
+
+        assert_eq!(b.target_body("a").as_deref(), Some("書き直した中身"));
+        assert!(b.target.join("skills/a/added.md").is_file());
+        assert_eq!(b.state_of("a"), ItemState::On, "記録が更新されていない");
+    }
+
+    // 更新では、ソースから消えたファイルがターゲットに残ってはいけない。
+    #[test]
+    fn re_copying_does_not_leave_files_the_source_no_longer_has() {
+        let mut b = Bench::new("apply-stale-file");
+        b.source_skill("a", "s");
+        b.t.write("source/skills/a/old.md", "消える予定");
+        b.apply(&on(&["a"]));
+
+        fs::remove_file(b.source.join("skills/a/old.md")).unwrap();
+        b.apply(&on(&["a"]));
+
+        assert!(!b.target.join("skills/a/old.md").exists());
+        assert_eq!(b.state_of("a"), ItemState::On);
+    }
+
+    #[test]
+    fn turning_something_off_removes_it_and_forgets_the_record() {
+        let mut b = Bench::new("apply-delete");
+        b.source_skill("a", "中身");
+        b.apply(&on(&["a"]));
+
+        let report = b.apply(&Selection::default());
+
+        assert_eq!(report.done.len(), 1);
+        assert!(!b.target.join("skills/a").exists());
+        assert!(b.manifest.find(ItemKind::Skill, "a").is_none());
+        assert_eq!(b.state_of("a"), ItemState::Off);
+    }
+
+    #[test]
+    fn pruning_clears_the_record_without_touching_anything_else() {
+        let mut b = Bench::new("apply-prune");
+        b.source_skill("a", "x");
+        b.record_with_hash("a", "もう存在しない実体のハッシュ");
+        b.target_skill("neighbour", "隣の実体");
+
+        b.apply(&Selection::default());
+
+        assert!(b.manifest.find(ItemKind::Skill, "a").is_none());
+        assert_eq!(
+            fs::read_to_string(b.target.join("skills/neighbour/SKILL.md")).unwrap(),
+            "隣の実体"
+        );
+    }
+
+    // 記録はディスクに残らなければ意味が無い。実体だけが残ると Unmanaged になり、
+    // 二度と外せなくなる。
+    #[test]
+    fn the_manifest_is_persisted_as_each_action_succeeds() {
+        let mut b = Bench::new("apply-persist");
+        b.source_skill("a", "中身");
+
+        b.apply(&on(&["a"]));
+
+        let on_disk = crate::manifest::load(&b.target).unwrap();
+        let entry = on_disk
+            .find(ItemKind::Skill, "a")
+            .expect("記録が保存されていない");
+        assert_eq!(
+            entry.content_hash,
+            hash_item(ItemKind::Skill, &b.target.join("skills/a")).unwrap()
+        );
+    }
+
+    // --- ゲート 3: 実行直前の再判定（TOCTOU） ---
+
+    // 計画を作った後、適用までの間に書き込み先が埋まった。計画時点の状態で実行しない。
+    #[test]
+    fn a_destination_occupied_after_planning_is_not_overwritten() {
+        let mut b = Bench::new("gate3-appeared");
+        b.source_skill("a", "ソース側");
+        let plan = build_plan(&b.resolve(), &on(&["a"]));
+
+        // ここで誰かが置いた。
+        b.t.write("target/skills/a/SKILL.md", "後から現れた実体");
+
+        let report = apply_plan(&plan, &b.target, &mut b.manifest);
+
+        assert!(report.done.is_empty());
+        assert!(matches!(
+            report.skipped.as_slice(),
+            [Skipped {
+                reason: SkipReason::Changed,
+                ..
+            }]
+        ));
+        assert_eq!(b.target_body("a").as_deref(), Some("後から現れた実体"));
+    }
+
+    // 削除の計画を作った後に、対象が書き換えられた。もう「自分が置いたもの」ではない。
+    #[test]
+    fn a_target_edited_after_planning_is_not_deleted() {
+        let mut b = Bench::new("gate3-edited");
+        b.source_skill("a", "中身");
+        b.apply(&on(&["a"]));
+        let plan = build_plan(&b.resolve(), &Selection::default());
+
+        b.t.write("target/skills/a/SKILL.md", "適用直前に手で書き換えた");
+
+        let report = apply_plan(&plan, &b.target, &mut b.manifest);
+
+        assert!(report.done.is_empty());
+        assert!(matches!(
+            report.skipped.as_slice(),
+            [Skipped {
+                reason: SkipReason::Changed,
+                ..
+            }]
+        ));
+        assert!(
+            b.target.join("skills/a").exists(),
+            "書き換えられたものを消した"
+        );
+        assert!(b.manifest.find(ItemKind::Skill, "a").is_some());
+    }
+
+    // 更新の計画を作った後に、ターゲットが書き換えられた。上書きは Conflict の許可が要る。
+    #[test]
+    fn an_update_whose_target_changed_after_planning_is_skipped() {
+        let mut b = Bench::new("gate3-update");
+        b.source_skill("a", "はじめ");
+        b.apply(&on(&["a"]));
+        b.source_skill("a", "新しいソース");
+        let plan = build_plan(&b.resolve(), &on(&["a"]));
+
+        b.t.write("target/skills/a/SKILL.md", "適用直前の手編集");
+
+        let report = apply_plan(&plan, &b.target, &mut b.manifest);
+
+        assert!(report.done.is_empty());
+        assert_eq!(b.target_body("a").as_deref(), Some("適用直前の手編集"));
+    }
+
+    // 掃除するはずの記録の実体が、適用までに戻ってきた。掃除してはいけない。
+    #[test]
+    fn a_record_whose_entity_came_back_is_not_pruned() {
+        let mut b = Bench::new("gate3-prune");
+        b.source_skill("a", "x");
+        b.record_with_hash("a", "計画時には存在しなかった");
+        let plan = build_plan(&b.resolve(), &Selection::default());
+
+        b.target_skill("a", "戻ってきた");
+
+        let report = apply_plan(&plan, &b.target, &mut b.manifest);
+
+        assert!(report.done.is_empty());
+        assert!(b.manifest.find(ItemKind::Skill, "a").is_some());
+    }
+
+    // 同じ計画を二度適用しても、二度目は再判定で止まる。
+    #[test]
+    fn applying_the_same_plan_twice_is_stopped_by_the_recheck() {
+        let mut b = Bench::new("gate3-twice");
+        b.source_skill("a", "中身");
+        let plan = build_plan(&b.resolve(), &on(&["a"]));
+
+        let first = apply_plan(&plan, &b.target, &mut b.manifest);
+        let second = apply_plan(&plan, &b.target, &mut b.manifest);
+
+        assert_eq!(first.done.len(), 1);
+        assert!(second.done.is_empty(), "二度目が素通りした");
+    }
+
+    // --- ゲート 4: 書き込み先の検証 ---
+
+    // 親ディレクトリがターゲット外へのリンク。canonical path で見れば外を指している。
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_reached_through_a_symlinked_parent_is_refused() {
+        let mut b = Bench::new("gate4-parent");
+        b.source_skill("a", "ソース側");
+        let outside = b.t.mkdir("outside");
+        fs::write(outside.join("keep.txt"), "外にあるもの").unwrap();
+        std::os::unix::fs::symlink(&outside, b.target.join("skills")).unwrap();
+
+        let report = b.apply(&on(&["a"]));
+
+        assert!(report.done.is_empty());
+        assert!(!outside.join("a").exists(), "ターゲットの外に書いた");
+        assert_eq!(
+            fs::read_to_string(outside.join("keep.txt")).unwrap(),
+            "外にあるもの"
+        );
+    }
+
+    // 書き込み先そのものがリンク。追わずに拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_that_is_itself_a_symlink_is_refused() {
+        let mut b = Bench::new("gate4-self");
+        b.source_skill("a", "ソース側");
+        let outside = b.t.mkdir("outside");
+        fs::write(outside.join("SKILL.md"), "外の中身").unwrap();
+        fs::create_dir_all(b.target.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&outside, b.target.join("skills/a")).unwrap();
+        // 記録を入れて Conflict にし、許可まで与えても通らないことを見る。
+        b.record_with_hash("a", "一致しない");
+
+        let mut sel = on(&["a"]);
+        sel.allow_conflict(ItemKind::Skill, "a");
+        let report = b.apply(&sel);
+
+        assert!(report.done.is_empty());
+        assert_eq!(
+            fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+            "外の中身"
+        );
+    }
+
+    // --- コピー元の検証 ---
+
+    // ソースにリンクが混ざっていたら、ターゲット外の内容を持ち込むことになる。
+    // 途中まで書いた状態も残さない。
+    #[cfg(unix)]
+    #[test]
+    fn a_source_containing_a_symlink_is_refused_without_a_partial_copy() {
+        let mut b = Bench::new("apply-srclink");
+        let dir = b.source_skill("a", "中身");
+        let outside = b.t.write("outside.txt", "外の秘密");
+        std::os::unix::fs::symlink(&outside, dir.join("link.md")).unwrap();
+
+        let report = b.apply(&on(&["a"]));
+
+        assert!(report.done.is_empty());
+        assert!(!report.failed.is_empty());
+        assert!(
+            !b.target.join("skills/a").exists(),
+            "途中まで書いたものが残った"
+        );
+    }
+
+    // 1 件失敗しても、他の項目は処理される。
+    #[cfg(unix)]
+    #[test]
+    fn one_failure_does_not_stop_the_rest() {
+        let mut b = Bench::new("apply-continue");
+        let bad = b.source_skill("bad", "x");
+        let outside = b.t.write("outside.txt", "外");
+        std::os::unix::fs::symlink(&outside, bad.join("link.md")).unwrap();
+        b.source_skill("good", "通るはず");
+
+        let report = b.apply(&on(&["bad", "good"]));
+
+        assert_eq!(report.done.len(), 1);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(b.target_body("good").as_deref(), Some("通るはず"));
     }
 }
