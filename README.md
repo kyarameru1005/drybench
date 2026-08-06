@@ -1,56 +1,57 @@
 # drybench
 
-**A local workbench for your Claude Code setup** — see what is installed in `~/.claude`,
-safely toggle skills, subagents and hooks on and off, and spin up new ones to try.
+**Claude Code 環境のための作業台** — `~/.claude` に何が入っているかを一覧し、スキル・
+サブエージェント・フックを安全に着脱し、新しいものを作って試す。
 
 <!-- TODO: demo GIF here (record with VHS so it can be re-recorded). See docs/demo.md -->
 
 > [!NOTE]
-> **v0.1 — not released yet.** This repository currently contains the skeleton only.
+> **v0.1 — 未リリース。** 現時点でこのリポジトリにあるのはスケルトンのみです。
 
 ---
 
-## The problem
+## 課題
 
-Write enough skills, subagents and hooks and `~/.claude` fills up. Two things get painful:
+スキルやサブエージェント、フックを書き溜めていくと `~/.claude` は膨らみます。そこで
+二つのことが面倒になります。
 
-- **You lose track of what is in there** — and whether you still need it.
-- **Hooks do not fire just because the file exists.** They have to be registered in
-  `settings.json`, by hand, in the right shape.
+- **何が入っているか分からなくなる** — そして、それがまだ必要なのかも分からない。
+- **フックはファイルを置いただけでは発火しない。** `settings.json` に、正しい形式で、
+  手作業で登録する必要があります。
 
-Trying out someone else's skill has the same shape: copy files in, edit JSON, and hope
-you can put it all back.
+他人のスキルを試すときも同じ構図です。ファイルをコピーし、JSON を編集し、あとで元に
+戻せることを祈る。
 
-## What drybench does
+## drybench がすること
 
-drybench is not a skill generator — Claude Code already writes skills better than a
-template ever will. drybench is the **bench you put them on**: it takes them in, tries
-them out, and takes them back off without leaving anything behind.
+drybench はスキル生成ツールではありません。テンプレートよりも Claude Code 自身のほうが
+うまくスキルを書きます。drybench が提供するのは、**それを載せる作業台**です。持ち込み、
+試し、何も残さずに降ろす。
 
-- **Inspect** — one screen showing everything in `~/.claude`, managed or not.
-- **Import** — take what is already there under management, non-destructively.
-- **Toggle** — install and uninstall, including the `settings.json` hook registration.
-- **Create** — scaffold a new skill and hand it straight to `$EDITOR` or `claude`.
+- **Inspect（一覧）** — `~/.claude` の中身を、管理下かどうかを問わず 1 画面に表示する。
+- **Import（取り込み）** — すでにそこにあるものを、非破壊的に管理下へ入れる。
+- **Toggle（着脱）** — インストールとアンインストール。`settings.json` のフック登録も含む。
+- **Create（生成）** — 新しいスキルの雛形を作り、そのまま `$EDITOR` や `claude` に渡す。
 
-## Safety, by design
+## 安全性は設計から
 
-This is the part that is not bolted on afterwards:
+ここが後付けではない部分です。
 
-1. **Anything not in the manifest is never touched.** Unmanaged entries are locked, always.
-2. **A manifest entry with a mismatched hash is not touched either.** Conflicts require
-   explicit permission.
-3. **State is re-checked immediately before writing** (no TOCTOU window).
-4. **Write targets are verified by canonical path** to be inside the destination
-   directory, and symlinked targets are refused.
-5. **Your `settings.json` is edited by removing only the exact group drybench added,**
-   matched by hash. Malformed JSON means drybench does nothing. Writes are backed up
-   and atomic.
-6. **Destructive operations always go through a confirmation screen.**
-7. **Nothing generated — including by Claude — is installed without your review.**
+1. **マニフェストにないものには一切触れない。** 未管理の項目は常にロックされます。
+2. **ハッシュが一致しないマニフェスト項目にも触れない。** コンフリクトの解消には明示的な
+   許可が必要です。
+3. **書き込み直前に状態を再確認する**（TOCTOU の隙間を作らない）。
+4. **書き込み先は正規化パスで宛先ディレクトリ内にあることを検証し**、シンボリックリンクの
+   ターゲットは拒否します。
+5. **`settings.json` は、drybench が追加したグループだけをハッシュ照合で特定して削除します。**
+   JSON が壊れている場合、drybench は何もしません。書き込みはバックアップを取り、アトミックに
+   行います。
+6. **破壊的な操作は必ず確認画面を経由します。**
+7. **生成されたものは、Claude によるものも含め、レビューなしにインストールされません。**
 
-The blast radius is limited to what drybench itself put there.
+影響範囲は、drybench 自身が置いたものに限定されます。
 
-## Install
+## インストール
 
 <!-- TODO: fill in once release binaries exist (macOS arm64, Linux x86_64/aarch64) -->
 
@@ -58,36 +59,35 @@ The blast radius is limited to what drybench itself put there.
 cargo install --path .
 ```
 
-## Usage
+## 使い方
 
 ```sh
-drybench                      # inspect ~/.claude
-drybench --source ./drafts    # use a different source directory
+drybench                      # ~/.claude を一覧する
+drybench --source ./drafts    # 別のソースディレクトリを使う
 drybench --help
 ```
 
 <!-- TODO: keybindings table -->
 
-## Compatibility
+## 対応状況
 
-Tested against Claude Code `<version>`.
+Claude Code `<version>` で動作確認。
 <!-- TODO: pin the verified version. The settings.json hook format is the moving part. -->
 
-## Non-goals
+## やらないこと
 
-- Calling any model API directly. drybench shells out to your `claude` binary, so it
-  never holds an API key.
-- Being a registry or sharing hub — that is what the official plugin marketplace is for.
-- Supporting agents other than Claude Code, at least through v1.
-- A GUI.
+- モデル API を直接叩くこと。drybench は `claude` バイナリを呼び出すだけなので、API キーを
+  保持しません。
+- レジストリや共有ハブになること。それは公式のプラグインマーケットプレイスの役割です。
+- Claude Code 以外のエージェントへの対応（少なくとも v1 までは）。
+- GUI。
 
-## Contributing
+## コントリビュート
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The module map is in
-[docs/architecture.md](docs/architecture.md), the roadmap in
-[docs/roadmap.md](docs/roadmap.md), and the rules that are not up for negotiation in
-[docs/design-principles.md](docs/design-principles.md).
+[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。モジュール構成は
+[docs/architecture.md](docs/architecture.md)、ロードマップは [docs/roadmap.md](docs/roadmap.md)、
+そして譲れないルールは [docs/design-principles.md](docs/design-principles.md) にあります。
 
-## License
+## ライセンス
 
-MIT — see [LICENSE](LICENSE).
+MIT — [LICENSE](LICENSE) を参照。
