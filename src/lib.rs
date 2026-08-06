@@ -15,3 +15,6 @@ pub mod scan;
 pub mod settings;
 pub mod sync;
 pub mod ui;
+
+#[cfg(test)]
+mod testutil;

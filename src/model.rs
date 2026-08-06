@@ -10,8 +10,14 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// 同期の単位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// マニフェストには小文字の文字列（`"skill"` / `"agent"` / `"hook"`）で保存する。
+/// **この表記を変えると既存のマニフェストが読めなくなる。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     Skill,
     Agent,
