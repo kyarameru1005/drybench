@@ -17,6 +17,22 @@
 //! - **登録に失敗してもファイル同期は巻き戻さない。** マニフェストを先に保存し、実体との
 //!   対応が取れた状態を保つ（もう一度 ON にすれば再登録される）。
 //!
+//! ## 書き換えで残る正規化
+//!
+//! 「`hooks` 以外に触らない」は値についての約束であって、バイト列についてではない。
+//! ファイル全体を読み直して書き戻す以上、次は変わる。**値は変えないが、書き方は変わる。**
+//!
+//! - インデントは 2 スペースに、末尾には改行が付く
+//! - `\uXXXX` は対応する文字に、`\/` は `/` に展開される
+//! - 指数表記の符号が明示される（`1e10` → `1e+10`）
+//!
+//! 数値そのものは `arbitrary_precision` で書かれたまま保つ（これが無いと 2^53 超の整数が
+//! 浮動小数に化け、`1e-400` が `0.0` に潰れる）。
+//!
+//! **重複キーだけは復元できない。** JSON の重複キーは後勝ちで畳まれるので、書き戻すと
+//! 先に書かれた方が消える。直前の内容はバックアップに残るが、次の書き換えで上書きされる。
+//! コメント付き JSON（JSONC）は解析できないため、そもそも何もしない。
+//!
 //! TODO(migrate): 実装は `apps/proteus/src/settings.rs` から移す。
 //! 移設時に加えること: バックアップのファイル名を `.proteus-backup` から
 //! `.drybench-backup` へ変更する。
@@ -43,6 +59,9 @@ pub const BACKUP_FILE: &str = "settings.json.drybench-backup";
 const HOOKS_KEY: &str = "hooks";
 
 static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// 一時ファイル名の生成を諦めるまでの試行回数。
+const TEMP_ATTEMPTS: usize = 8;
 
 // ------------------------------------------------------------ hook.json
 
@@ -92,22 +111,35 @@ pub fn register(
     let mut root = read_settings(&path)?;
 
     let mut registrations = Vec::new();
+    let mut changed = false;
     for event in &spec.events {
         let group = build_group(event);
+        let hash = group_hash(&group);
         registrations.push(HookRegistration {
             event: event.event.clone(),
-            group_hash: group_hash(&group),
+            group_hash: hash.clone(),
         });
 
-        hooks_object(&mut root)
+        let groups = hooks_object(&mut root)?
             .entry(event.event.clone())
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .ok_or_else(|| SettingsError::UnexpectedShape(event.event.clone()))?
-            .push(group);
+            .ok_or_else(|| {
+                SettingsError::UnexpectedShape(format!("hooks.{} が配列でない", event.event))
+            })?;
+
+        // 同じグループが既にあるなら足さない。二重に入れると、記録は 1 件しか
+        // 残らないので片方が管理外の孤児になり、消したスクリプトを呼び続ける。
+        if groups.iter().any(|g| group_hash(g) == hash) {
+            continue;
+        }
+        groups.push(group);
+        changed = true;
     }
 
-    write_settings(claude_dir, &path, &root)?;
+    if changed {
+        write_settings(claude_dir, &path, &root)?;
+    }
     Ok(registrations)
 }
 
@@ -132,27 +164,40 @@ pub fn unregister(
 
     let mut changed = false;
     for registration in registrations {
-        let hooks = hooks_object(&mut root);
+        let hooks = hooks_object(&mut root)?;
         let Some(groups) = hooks
             .get_mut(&registration.event)
             .and_then(|v| v.as_array_mut())
         else {
             continue;
         };
-        if let Some(i) = groups
+        let Some(i) = groups
             .iter()
             .position(|g| group_hash(g) == registration.group_hash)
-        {
-            groups.remove(i);
-            changed = true;
-        }
-        // 自分が入れたグループを抜いて空になったイベントは畳む。
+        else {
+            // 一致するものが無い。**このイベントには何もしない** — 空の配列が
+            // 残っていても、それは drybench が作ったものとは限らない。
+            continue;
+        };
+        groups.remove(i);
+        changed = true;
+
+        // 自分が入れたグループを抜いて空になったイベントだけを畳む。
         if groups.is_empty() {
             hooks.remove(&registration.event);
         }
     }
 
     if changed {
+        // 自分が作った `hooks` を空のまま残さない。ユーザーが元から持っていた
+        // `hooks` は、この時点で空になっていない限り残る。
+        if let Some(hooks) = root.get(HOOKS_KEY).and_then(|v| v.as_object()) {
+            if hooks.is_empty() {
+                root.as_object_mut()
+                    .expect("上で確認済み")
+                    .remove(HOOKS_KEY);
+            }
+        }
         write_settings(claude_dir, &path, &root)?;
     }
     Ok(())
@@ -211,15 +256,30 @@ fn canonical(value: &Value) -> String {
 
 /// `hooks` オブジェクトへの可変参照。無ければ作る。
 /// **ここ以外のキーには一切触れない。**
-fn hooks_object(root: &mut Value) -> &mut Map<String, Value> {
-    let obj = root
-        .as_object_mut()
-        .expect("読み込み時にオブジェクトを保証");
-    obj.entry(HOOKS_KEY.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    obj.get_mut(HOOKS_KEY)
+///
+/// `hooks` が既にあってオブジェクトでない場合（`"hooks": []` の打ち間違いなど）は
+/// **エラーを返す。** 作り直せば、ユーザーが書いたものを黙って捨てることになる。
+fn hooks_object(root: &mut Value) -> Result<&mut Map<String, Value>, SettingsError> {
+    let obj = root.as_object_mut().ok_or_else(|| {
+        SettingsError::UnexpectedShape("settings.json がオブジェクトでない".into())
+    })?;
+
+    match obj.get(HOOKS_KEY) {
+        None => {
+            obj.insert(HOOKS_KEY.to_string(), Value::Object(Map::new()));
+        }
+        Some(existing) if !existing.is_object() => {
+            return Err(SettingsError::UnexpectedShape(format!(
+                "settings.json の \"{HOOKS_KEY}\" がオブジェクトでない"
+            )));
+        }
+        Some(_) => {}
+    }
+
+    Ok(obj
+        .get_mut(HOOKS_KEY)
         .and_then(|v| v.as_object_mut())
-        .expect("直前に挿入している")
+        .expect("直前にオブジェクトであることを確認済み"))
 }
 
 // ------------------------------------------------------------- 読み書き
@@ -236,12 +296,16 @@ fn read_settings(path: &Path) -> Result<Value, SettingsError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Object(Map::new())),
         Err(e) => return Err(SettingsError::Io(path.to_path_buf(), e)),
     };
+    // 先頭の BOM を落とす。Claude Code 自身は受け付けるので、これで解析できないと
+    // 「自分の設定が読めない」と言われて終わってしまう。
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+
     if raw.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
     }
 
     let value: Value =
-        serde_json::from_str(&raw).map_err(|e| SettingsError::Parse(path.to_path_buf(), e))?;
+        serde_json::from_str(raw).map_err(|e| SettingsError::Parse(path.to_path_buf(), e))?;
     if !value.is_object() {
         return Err(SettingsError::UnexpectedShape(
             "settings.json の中身がオブジェクトではない".to_string(),
@@ -255,38 +319,88 @@ fn read_settings(path: &Path) -> Result<Value, SettingsError> {
 /// **退避するのは、解析できた内容だけ。** 壊れたファイルはここへ来ない（`read_settings`
 /// が先に `Err` を返す）ので、バックアップが壊れた内容で上書きされることはない。
 fn write_settings(claude_dir: &Path, path: &Path, root: &Value) -> Result<(), SettingsError> {
-    if let Ok(existing) = fs::read(path) {
+    fs::create_dir_all(claude_dir).map_err(|e| SettingsError::Io(claude_dir.to_path_buf(), e))?;
+
+    let existing = fs::read(path).ok();
+    // 元のファイルの権限を引き継ぐ。`settings.json` には `env` の値が入りうるので、
+    // 0600 にしてある人のものを 0644 で置き換えてはいけない。
+    let mode = existing
+        .is_some()
+        .then(|| fs::metadata(path).ok().map(|m| m.permissions()))
+        .flatten();
+
+    if let Some(existing) = existing {
         let backup = claude_dir.join(BACKUP_FILE);
-        fs::write(&backup, existing).map_err(|e| SettingsError::Io(backup, e))?;
+        // **バックアップ先もリンクを追わない。** 固定の名前なので、ここが
+        // ターゲット外へのリンクだと、無関係のファイルを切り詰めて上書きする。
+        refuse_symlink(&backup)?;
+        write_atomically(claude_dir, &backup, &existing, mode.clone())?;
     }
 
-    let body = serde_json::to_string_pretty(root).map_err(SettingsError::Serialize)?;
+    let mut body = serde_json::to_string_pretty(root).map_err(SettingsError::Serialize)?;
+    // 末尾の改行の有無は、ユーザーのファイルの見た目の一部。元に合わせる。
+    body.push('\n');
 
-    let temp = claude_dir.join(format!(
-        "{SETTINGS_FILE}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    // `create_new` なので、既存のファイルにもリンクにも書き込まない。
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|e| SettingsError::Io(temp.clone(), e))?;
+    write_atomically(claude_dir, path, body.as_bytes(), mode)
+}
 
-    let written = file
-        .write_all(body.as_bytes())
-        .and_then(|_| file.sync_all());
+/// 一時ファイルへ書いてから `rename` で置き換える。
+///
+/// `create_new` で開くので、既存のファイルにもシンボリックリンクにも書き込まない。
+/// 名前は毎回変える — 固定名にすると、前回のクラッシュが残した残骸で以後ずっと
+/// 書けなくなる。
+fn write_atomically(
+    claude_dir: &Path,
+    path: &Path,
+    body: &[u8],
+    mode: Option<fs::Permissions>,
+) -> Result<(), SettingsError> {
+    let (temp, mut file) = create_temp(claude_dir)?;
+
+    let written = file.write_all(body).and_then(|_| file.sync_all());
     drop(file);
     if let Err(e) = written {
         let _ = fs::remove_file(&temp);
         return Err(SettingsError::Io(temp, e));
     }
 
-    fs::rename(&temp, path).map_err(|e| {
+    if let Some(mode) = mode {
+        let _ = fs::set_permissions(&temp, mode);
+    }
+
+    if let Err(e) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
-        SettingsError::Io(path.to_path_buf(), e)
-    })
+        return Err(SettingsError::Io(path.to_path_buf(), e));
+    }
+
+    // rename 自体を耐久化する。
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(claude_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// まだ存在しない一時ファイルを作って開く。前回のクラッシュが残した残骸と衝突しても、
+/// 数回ずらせば空きが見つかる。
+fn create_temp(claude_dir: &Path) -> Result<(PathBuf, fs::File), SettingsError> {
+    let pid = std::process::id();
+    let mut last = None;
+    for _ in 0..TEMP_ATTEMPTS {
+        let n = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = claude_dir.join(format!("{SETTINGS_FILE}.{pid}.{n}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some((path, e)),
+            Err(e) => return Err(SettingsError::Io(path, e)),
+        }
+    }
+    let (path, e) = last.expect("TEMP_ATTEMPTS は 1 以上");
+    Err(SettingsError::Io(path, e))
 }
 
 /// 対象自体がシンボリックリンクなら拒否する（設計原則 4）。
@@ -686,6 +800,212 @@ mod tests {
         let b = serde_json::json!({"hooks":[{"command":"x","type":"command"}],"matcher":"Bash"});
 
         assert_eq!(group_hash(&a), group_hash(&b));
+    }
+
+    // --- ユーザーが書いた値を変えないこと ---
+
+    // `Value` で比較していると、書式も数値の型も見えない。**書いた値そのもの**が
+    // 残っているかは、生の JSON を見ないと分からない。
+    #[test]
+    fn the_users_values_survive_being_rewritten() {
+        let t = TempDir::new("reg-values");
+        t.write(
+            SETTINGS_FILE,
+            r#"{"big":12345678901234567890123,"tiny":1e-400,"exp":1e10,"esc":"a\/b"}"#,
+        );
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        register(t.path(), &spec).unwrap();
+
+        let raw = fs::read_to_string(t.join(SETTINGS_FILE)).unwrap();
+        // 値そのものが失われていないこと。書式の正規化（`1e10` → `1e+10`、
+        // `a\/b` → `a/b`）は起きるが、いずれも同じ値を表す別の書き方でしかない。
+        assert!(
+            raw.contains("12345678901234567890123"),
+            "2^53 超の整数が浮動小数に化けた:\n{raw}"
+        );
+        assert!(raw.contains("1e-400"), "極小の指数が 0 に潰れた:\n{raw}");
+        assert!(
+            raw.contains("1e10") || raw.contains("1e+10"),
+            "指数表記が展開された:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn the_file_ends_with_a_newline_like_a_normal_text_file() {
+        let t = TempDir::new("reg-newline");
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        register(t.path(), &spec).unwrap();
+
+        assert!(fs::read_to_string(t.join(SETTINGS_FILE))
+            .unwrap()
+            .ends_with('\n'));
+    }
+
+    // --- 想定外の形 ---
+
+    // `"hooks": []` は打ち間違いとして十分ありうる。落ちてはいけないし、作り直して
+    // ユーザーが書いたものを捨ててもいけない。
+    #[test]
+    fn a_hooks_key_that_is_not_an_object_is_an_error_not_a_crash() {
+        let t = TempDir::new("reg-hooks-shape");
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        for broken in [r#"{"hooks":[]}"#, r#"{"hooks":null}"#, r#"{"hooks":"x"}"#] {
+            t.write(SETTINGS_FILE, broken);
+
+            assert!(matches!(
+                register(t.path(), &spec),
+                Err(SettingsError::UnexpectedShape(..))
+            ));
+            assert_eq!(fs::read_to_string(t.join(SETTINGS_FILE)).unwrap(), broken);
+
+            let fake = [HookRegistration {
+                event: "PostToolUse".to_string(),
+                group_hash: "何であれ".to_string(),
+            }];
+            assert!(unregister(t.path(), &fake).is_err());
+            assert_eq!(fs::read_to_string(t.join(SETTINGS_FILE)).unwrap(), broken);
+        }
+    }
+
+    #[test]
+    fn a_settings_file_with_a_byte_order_mark_is_still_readable() {
+        let t = TempDir::new("reg-bom");
+        t.write(SETTINGS_FILE, "\u{feff}{\"model\":\"opus\"}");
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        register(t.path(), &spec).unwrap();
+
+        assert_eq!(settings_of(&t)["model"], "opus");
+    }
+
+    // --- バックアップ ---
+
+    // 固定の名前なので、ここがリンクだと無関係のファイルを切り詰めて上書きする。
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_backup_path_is_refused() {
+        let t = TempDir::new("reg-backup-symlink");
+        let victim = t.write("victim.txt", "壊されては困る");
+        let claude = t.mkdir("claude");
+        fs::write(claude.join(SETTINGS_FILE), r#"{"model":"opus"}"#).unwrap();
+        std::os::unix::fs::symlink(&victim, claude.join(BACKUP_FILE)).unwrap();
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        assert!(register(&claude, &spec).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "壊されては困る");
+    }
+
+    // `settings.json` には `env` の値が入りうる。0600 にしてある人のものを
+    // 0644 で置き換えない。
+    #[cfg(unix)]
+    #[test]
+    fn the_file_mode_is_carried_over() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = TempDir::new("reg-mode");
+        t.write(SETTINGS_FILE, r#"{"env":{"TOKEN":"秘密"}}"#);
+        fs::set_permissions(t.join(SETTINGS_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        register(t.path(), &spec).unwrap();
+
+        let mode = |p: std::path::PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(t.join(SETTINGS_FILE)), 0o600);
+        assert_eq!(mode(t.join(BACKUP_FILE)), 0o600, "バックアップが緩い");
+    }
+
+    // 前回のクラッシュが残した一時ファイルで、以後ずっと書けなくなってはいけない。
+    #[test]
+    fn a_leftover_temporary_file_does_not_block_the_next_write() {
+        let t = TempDir::new("reg-stale-tmp");
+        t.write(format!("{SETTINGS_FILE}.99999.0.tmp"), "クラッシュの残骸");
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        register(t.path(), &spec).unwrap();
+
+        assert_eq!(
+            settings_of(&t)["hooks"]["PostToolUse"][0]["matcher"],
+            "Bash"
+        );
+    }
+
+    #[test]
+    fn registering_works_when_the_directory_does_not_exist_yet() {
+        let t = TempDir::new("reg-nodir");
+        let claude = t.join("not-created-yet");
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        register(&claude, &spec).unwrap();
+
+        assert!(claude.join(SETTINGS_FILE).is_file());
+    }
+
+    // --- 二重登録 ---
+
+    // 二重に入れると、記録は 1 件しか残らないので片方が管理外の孤児になり、
+    // 消したスクリプトを呼び続ける。
+    #[test]
+    fn registering_the_same_hook_twice_does_not_duplicate_the_group() {
+        let t = TempDir::new("reg-twice");
+        let spec = read_spec(&hook_dir(&t, "h", HOOK_JSON)).unwrap();
+
+        let first = register(t.path(), &spec).unwrap();
+        let second = register(t.path(), &spec).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            settings_of(&t)["hooks"]["PostToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 一度の解除で完全に消える。
+        unregister(t.path(), &first).unwrap();
+        assert!(settings_of(&t).get("hooks").is_none());
+    }
+
+    // --- 何も一致しなかったとき ---
+
+    // 一致するものが無いイベントには何もしない。空の配列が残っていても、
+    // それが drybench の作ったものとは限らない。
+    #[test]
+    fn an_event_we_removed_nothing_from_is_left_alone() {
+        let t = TempDir::new("unreg-untouched-event");
+        let spec = read_spec(&hook_dir(
+            &t,
+            "h",
+            r#"{"events":[
+                {"event":"Stop","command":"/bin/true"},
+                {"event":"PostToolUse","matcher":"Bash","command":"/bin/true"}
+            ]}"#,
+        ))
+        .unwrap();
+        let registrations = register(t.path(), &spec).unwrap();
+
+        // ユーザーが PostToolUse 側だけ手で消し、空の配列を残した。
+        // 加えて、無関係の空配列も置いてある。
+        let mut v = settings_of(&t);
+        v["hooks"]["PostToolUse"] = serde_json::json!([]);
+        v["hooks"]["UserPromptSubmit"] = serde_json::json!([]);
+        t.write(SETTINGS_FILE, &serde_json::to_string(&v).unwrap());
+
+        unregister(t.path(), &registrations).unwrap();
+
+        let after = settings_of(&t);
+        assert!(
+            after["hooks"].get("PostToolUse").is_some(),
+            "何も消していないイベントを畳んだ: {after}"
+        );
+        assert!(after["hooks"].get("UserPromptSubmit").is_some());
+        assert!(
+            after["hooks"].get("Stop").is_none(),
+            "自分のものは消えるはず"
+        );
     }
 
     #[test]
