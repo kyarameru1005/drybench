@@ -22,7 +22,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: ~/.claude/settings.json を読み書きするとき、ユーザーが書いた
 # キーの並び順を変えないため（ハッシュ照合の決定性にも必要）。
-serde_json = { version = "1", features = ["preserve_order"] }
+# arbitrary_precision: 数値を書かれたまま持ち回るため。無いと settings.json の
+# 全書き換えで 2^53 超の整数が浮動小数に化け、1e-400 が 0.0 に潰れる。
+# ユーザーが書いた値をこちらの都合で変えないための必須設定。
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.10"
 dirs = "5"
 chrono = { version = "0.4", features = ["clock"] }
